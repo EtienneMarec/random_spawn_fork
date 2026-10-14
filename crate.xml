@@ -1,0 +1,15 @@
+<Entity>
+	<PixelSceneComponent
+		pixel_scene="mods/Fork/crate.png"
+		pixel_scene_visual="mods/Fork/crate_visual.png"
+		pixel_scene_background="mods/Fork/crate_background.png"
+		offset_x="-80"
+		offset_y="-60"
+		skip_biome_checks="1"
+		>
+	</PixelSceneComponent>
+	<LifetimeComponent
+		lifetime="2"
+		>
+	</LifetimeComponent>
+</Entity>
