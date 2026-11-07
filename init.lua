@@ -1,200 +1,228 @@
-delay = dofile("mods/Fork/delay.lua")
+-- Settings keys keep the original mod's prefix so existing settings are preserved.
+local SETTING = "evaisa.randomspawn."
 
-local max_search_range = 512
-local step_size = 16
+local DATA_FILE = "biome_chunks.json"
+local START_BIOME_KEY = "evaisa_randomspawn_start_biome"
+
+local CHUNK_SIZE = 512
+local MAX_SPAWN_TRIES = 100
+local WORLD_LOAD_TIMEOUT = 300 -- frames to wait for a chunk to stream in before trying another point
+
+-- Find this mod's folder, so the mod works whatever its folder is named.
+local function is_this_mod(path)
+    return ModDoesFileExist(path .. DATA_FILE)
+        and ModDoesFileExist(path .. "parse_json.lua")
+        and ModDoesFileExist(path .. "crate.xml")
+end
+
+local function find_mod_path()
+    for _, id in ipairs(ModGetActiveModIDs() or {}) do
+        local path = "mods/" .. id .. "/"
+        if is_this_mod(path) then
+            return path
+        end
+    end
+    return "mods/Fork/"
+end
+
+local MOD_PATH = find_mod_path()
+local CRATE_FILE = MOD_PATH .. "crate.xml"
+
+-- Remember the path so settings.lua can find the mod files too.
+ModSettingSet(SETTING .. "mod_path", MOD_PATH)
+
+-- crate.xml references its images as "mods/Fork/..."; point them at the real folder.
+if MOD_PATH ~= "mods/Fork/" then
+    local crate = ModTextFileGetContent(CRATE_FILE)
+    if crate then
+        local replacement = MOD_PATH:gsub("%%", "%%%%")
+        ModTextFileSetContent(CRATE_FILE, (crate:gsub("mods/Fork/", replacement)))
+    end
+end
+
+local delay = dofile(MOD_PATH .. "delay.lua")
+local parse_json = dofile(MOD_PATH .. "parse_json.lua")
 
 function OnWorldPostUpdate()
     delay.update()
 end
 
-local get_content = ModTextFileGetContent
+local function split(str)
+    local items = {}
+    for item in string.gmatch(tostring(str or ""), "[^,]+") do
+        table.insert(items, item)
+    end
+    return items
+end
 
-function OnPlayerSpawned( player_entity )
-    
-    if GameHasFlagRun("random_spawn_picked") then
+local function to_set(list)
+    local set = {}
+    for _, item in ipairs(list) do
+        set[item] = true
+    end
+    return set
+end
+
+local function shuffle(tbl)
+    for i = #tbl, 2, -1 do
+        local j = Random(1, i)
+        tbl[i], tbl[j] = tbl[j], tbl[i]
+    end
+    return tbl
+end
+
+-- A biome is enabled if the player enabled it, or if it isn't disabled
+-- (by the player or by "actif": 0 in the data file). Biomes without chunks are skipped.
+local function get_enabled_biomes(all_biomes)
+    local whitelist = to_set(split(ModSettingGet(SETTING .. "whitelist")))
+    local blacklist = to_set(split(ModSettingGet(SETTING .. "blacklist")))
+
+    local enabled = {}
+    for _, biome in ipairs(all_biomes) do
+        local on
+        if blacklist[biome.name] then
+            on = false
+        elseif whitelist[biome.name] then
+            on = true
+        else
+            on = biome.active ~= 0
+        end
+
+        if on and #biome.chunks > 0 then
+            table.insert(enabled, biome)
+        end
+    end
+    return enabled
+end
+
+-- Go through a shuffled list of the enabled biomes, one per run.
+-- The order is stored in mod settings so it carries over between runs.
+local function pick_shuffled(biomes, last_biome)
+    local by_name = {}
+    local names = {}
+    for _, biome in ipairs(biomes) do
+        by_name[biome.name] = biome
+        table.insert(names, biome.name)
+    end
+    table.sort(names)
+    local signature = table.concat(names, ",")
+
+    local order = split(ModSettingGet(SETTING .. "shuffle_order"))
+    local index = tonumber(ModSettingGet(SETTING .. "shuffle_index")) or 0
+
+    if ModSettingGet(SETTING .. "shuffle_signature") ~= signature or index >= #order then
+        order = shuffle(names)
+        -- Don't start a new cycle with the biome the last run used.
+        if #order > 1 and order[1] == last_biome then
+            order[1], order[2] = order[2], order[1]
+        end
+        index = 0
+        ModSettingSet(SETTING .. "shuffle_order", table.concat(order, ","))
+        ModSettingSet(SETTING .. "shuffle_signature", signature)
+    end
+
+    ModSettingSet(SETTING .. "shuffle_index", index + 1)
+    return by_name[order[index + 1]] or biomes[Random(1, #biomes)]
+end
+
+local function pick_biome(biomes)
+    local last_biome = ModSettingGet(SETTING .. "last_biome") or ""
+
+    if ModSettingGet(SETTING .. "shuffle_mode") then
+        return pick_shuffled(biomes, last_biome)
+    end
+
+    local candidates = biomes
+    if ModSettingGet(SETTING .. "no_repeat_spawn") and #biomes > 1 then
+        candidates = {}
+        for _, biome in ipairs(biomes) do
+            if biome.name ~= last_biome then
+                table.insert(candidates, biome)
+            end
+        end
+        if #candidates == 0 then
+            candidates = biomes
+        end
+    end
+
+    return candidates[Random(1, #candidates)]
+end
+
+local function place_player(player_entity, x, y)
+    EntityApplyTransform(player_entity, x, y)
+    EntityLoad(CRATE_FILE, x, y)
+end
+
+local function try_spawn(player_entity, biome, tries)
+    tries = tries + 1
+    local chunk = biome.chunks[Random(1, #biome.chunks)]
+
+    if tries > MAX_SPAWN_TRIES then
+        -- Too many failed attempts: use the center of a chunk without checking.
+        place_player(player_entity, chunk.x * CHUNK_SIZE + CHUNK_SIZE / 2, chunk.y * CHUNK_SIZE + CHUNK_SIZE / 2)
         return
     end
 
-    GameAddFlagRun("random_spawn_picked")
+    local x = chunk.x * CHUNK_SIZE + Random(0, CHUNK_SIZE - 1)
+    local y = chunk.y * CHUNK_SIZE + Random(0, CHUNK_SIZE - 1)
 
-    -- Enregistrer le nombre d'essais dans les parametres "safe"
-    -- Vous pourrez consulter ce nombre manuellement dans le fichier 'save00/mod_config.xml' de Noita
-    local count = tonumber(ModSettingGetNextValue("evaisa.randomspawn.attempt_count")) or 0
-    count = count + 1
-    ModSettingSetNextValue("evaisa.randomspawn.attempt_count", count, false)
+    -- Move the camera there to force the chunk to load.
+    GameSetCameraPos(x, y)
 
-    local parse_json = dofile("mods/Fork/parse_json.lua")
-    local parsed_biomes = parse_json.get_biomes()
-    
-    local a, b, c, d, e, f = GameGetDateAndTimeLocal()
-    local time = a + b + c + d + e + f
-	local seed = tonumber(MagicNumbersGetValue("WORLD_SEED") or 0)
-    SetRandomSeed(seed + 324523, seed + 3285239)
-
-
-	local function shuffle(tbl)
-	  for i = #tbl, 2, -1 do
-		local j = Random(1, i)
-		tbl[i], tbl[j] = tbl[j], tbl[i]
-	  end
-	  return tbl
-	end
-	
-	-- Removed shuffle(positions) as positions is no longer used
-
-    local random_biome_list = {}
-    local function GenerateRandomBiomeList()
-		local whitelist = ModSettingGet("evaisa.randomspawn.whitelist") or ""
-
-		local whitelist_biomes = {}
-		if whitelist ~= "" then
-			for biome in string.gmatch(whitelist, "[^,]+") do
-				whitelist_biomes[biome] = true
-			end
-		end
-
-        random_biome_list = {}
-		local all_biomes = {}
-        for i, v in ipairs(parsed_biomes) do
-			table.insert(all_biomes, v.name)
-            if (whitelist == "" and v.active ~= 0) or whitelist_biomes[v.name] then
-				table.insert(random_biome_list, v)
-            end
-        end
-
-		GlobalsSetValue("evaisa_randomspawn_biomelist", table.concat(all_biomes, ","))
+    -- Gold biomes are almost entirely solid, so the free-space check would always fail.
+    if biome.skip_ground_check then
+        place_player(player_entity, x, y)
+        return
     end
 
-	local attempts = 20
-
-    local function ChooseSpawn()
-
-        GenerateRandomBiomeList()
-
-		if #random_biome_list == 0 then
-			print("Error: No valid biomes found!")
-			return
-		end
---???
-		local no_repeat = ModSettingGet("evaisa.randomspawn.no_repeat_spawn")
-		local shuffle_mode = ModSettingGet("evaisa.randomspawn.shuffle_mode")
-		local last_biome = ModSettingGet("evaisa.randomspawn.last_biome") or ""
-		
-		local index = 1
-
-		if shuffle_mode then
-			local shuffled_list = GlobalsGetValue("evaisa_randomspawn_shuffled_list", "")
-			local shuffle_index = tonumber(GlobalsGetValue("evaisa_randomspawn_shuffle_index", "0"))
-			local saved_biomelist = GlobalsGetValue("evaisa_randomspawn_saved_biomelist", "")
-			local current_biomelist = GlobalsGetValue("evaisa_randomspawn_biomelist", "")
-			
-			if shuffled_list == "" or shuffle_index >= #random_biome_list or saved_biomelist ~= current_biomelist then
-				local shuffled_indices = {}
-				for i = 1, #random_biome_list do
-					table.insert(shuffled_indices, i)
-				end
-				shuffle(shuffled_indices)
-				
-				local shuffled_str = table.concat(shuffled_indices, ",")
-				GlobalsSetValue("evaisa_randomspawn_shuffled_list", shuffled_str)
-				GlobalsSetValue("evaisa_randomspawn_shuffle_index", "0")
-				GlobalsSetValue("evaisa_randomspawn_saved_biomelist", current_biomelist)
-				shuffle_index = 0
-			end
-			
-			local indices = {}
-			for idx_str in string.gmatch(GlobalsGetValue("evaisa_randomspawn_shuffled_list", ""), "[^,]+") do
-				local idx = tonumber(idx_str)
-				if idx then
-					table.insert(indices, idx)
-				end
-			end
-			
-			if #indices > 0 then
-				index = indices[shuffle_index + 1] or 1
-				GlobalsSetValue("evaisa_randomspawn_shuffle_index", tostring(shuffle_index + 1))
-			else
-				index = 1
-			end
-		elseif no_repeat then
-			local attempts = 0
-			local max_attempts = 100
-			
-			repeat
-				index = Random(1, #random_biome_list)
-				attempts = attempts + 1
-			until random_biome_list[index].name ~= last_biome or attempts >= max_attempts or #random_biome_list == 1
-		else
-        	index = Random(1, #random_biome_list)
-		end
-
-        local chosen_biome = random_biome_list[index]
-		ModSettingSet("evaisa.randomspawn.last_biome", chosen_biome.name)
-
-        local max_tries = 100
-        local tries = 0
-        local function TrySpawn()
-            tries = tries + 1
-            if tries > max_tries then
-                -- Fallback to center of chosen chunk if we fail too many times
-                local chunk = chosen_biome.chunks[Random(1, #chosen_biome.chunks)]
-                local spawn_x = chunk.x * 512 + 256
-                local spawn_y = chunk.y * 512 + 256
-                EntityApplyTransform(player_entity, spawn_x, spawn_y)
-                EntityLoad("mods/Fork/crate.xml", spawn_x, spawn_y)
-                return
-            end
-
-            if not chosen_biome.chunks or #chosen_biome.chunks == 0 then
-                print("Error: No chunks for biome " .. tostring(chosen_biome.name))
-                return
-            end
-
-            local chunk = chosen_biome.chunks[Random(1, #chosen_biome.chunks)]
-            local world_x = chunk.x * 512
-            local world_y = chunk.y * 512
-
-            local spawn_x = world_x + Random(0, 512)
-            local spawn_y = world_y + Random(0, 512)
-
-            -- Exception pour le biome gold (ou "or") : on spawn sans vérifier si c'est solide/liquide
-            local biome_name_lower = string.lower(tostring(chosen_biome.name))
-            if string.match(biome_name_lower, "gold") or string.match(biome_name_lower, "or") then
-                GameSetCameraPos(spawn_x, spawn_y)
-                EntityApplyTransform(player_entity, spawn_x, spawn_y)
-                EntityLoad("mods/Fork/crate.xml", spawn_x, spawn_y)
-                return
-            end
-
-            -- Move camera to force chunk loading
-            GameSetCameraPos(spawn_x, spawn_y)
-
-            -- Check if position is safe
-            delay.new(function() 
-                return DoesWorldExistAt(spawn_x - 5, spawn_y - 5, spawn_x + 5, spawn_y + 5)
-            end, function() 
-                -- RaytraceSurfaces renvoie true s'il touche un solide. 
-                -- Cela permet de spawner dans les liquides (l'eau) ou le vide.
-                local hit = RaytraceSurfaces(spawn_x, spawn_y, spawn_x, spawn_y)
-                if hit then
-                    -- Solide, on réessaie
-                    delay.new(1, function()
-                        TrySpawn()
-                    end)
-                else
-                    EntityApplyTransform(player_entity, spawn_x, spawn_y)
-                    EntityLoad("mods/Fork/crate.xml", spawn_x, spawn_y)
-                end
+    local waited = 0
+    delay.new(function()
+        waited = waited + 1
+        return waited > WORLD_LOAD_TIMEOUT or DoesWorldExistAt(x - 5, y - 5, x + 5, y + 5)
+    end, function()
+        -- RaytraceSurfaces hits only solids, so liquids and empty space are valid spawn points.
+        if waited <= WORLD_LOAD_TIMEOUT and not RaytraceSurfaces(x, y, x, y) then
+            place_player(player_entity, x, y)
+        else
+            delay.new(1, function()
+                try_spawn(player_entity, biome, tries)
             end)
         end
-
-        TrySpawn()
-    end
-
-    ChooseSpawn()
+    end)
 end
 
-function OnPlayerDied( player_entity )
-    local biome_name = ModSettingGet("evaisa.randomspawn.last_biome") or "Inconnu"
-    GamePrintImportant("Starting location", GameTextGetTranslatedOrNot(tostring(biome_name)))
+function OnPlayerSpawned(player_entity)
+    if GameHasFlagRun("random_spawn_picked") then
+        return
+    end
+    GameAddFlagRun("random_spawn_picked")
+
+    -- Count runs. The value is visible in the mod settings and in save00/mod_config.xml.
+    local count = tonumber(ModSettingGetNextValue(SETTING .. "attempt_count")) or 0
+    ModSettingSetNextValue(SETTING .. "attempt_count", count + 1, false)
+
+    local seed = tonumber(MagicNumbersGetValue("WORLD_SEED")) or 0
+    SetRandomSeed(seed + 324523, seed + 3285239)
+
+    local biomes = get_enabled_biomes(parse_json.get_biomes(MOD_PATH .. DATA_FILE))
+    if #biomes == 0 then
+        print("Random Spawns: no enabled biome with spawn data, using the normal spawn.")
+        GamePrint("Random Spawns: no biome is enabled, using the normal spawn.")
+        return
+    end
+
+    local biome = pick_biome(biomes)
+    biome.skip_ground_check = string.find(string.lower(biome.name), "gold", 1, true) ~= nil
+
+    ModSettingSet(SETTING .. "last_biome", biome.name)
+    GlobalsSetValue(START_BIOME_KEY, biome.name)
+
+    try_spawn(player_entity, biome, 0)
+end
+
+function OnPlayerDied(player_entity)
+    local biome_name = GlobalsGetValue(START_BIOME_KEY, "")
+    if biome_name ~= "" then
+        GamePrintImportant("Starting location", GameTextGetTranslatedOrNot(biome_name))
+    end
 end

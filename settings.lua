@@ -1,6 +1,31 @@
 dofile("data/scripts/lib/mod_settings.lua") 
 
-local mod_id = "evaisa.randomspawn" -- This should match the name of your mod's folder.
+local mod_id = "evaisa.randomspawn" -- Prefix of the settings keys, kept from the original mod so existing settings still load.
+
+local DATA_FILE = "biome_chunks.json"
+
+-- Find this mod's folder, so the mod works whatever its folder is named.
+-- Some Mod* functions may not be available in the settings context, hence the pcalls.
+local function find_mod_path()
+	local ok, ids = pcall(ModGetActiveModIDs)
+	if ok and type(ids) == "table" then
+		for _, id in ipairs(ids) do
+			local path = "mods/" .. id .. "/"
+			local ok_data, has_data = pcall(ModDoesFileExist, path .. DATA_FILE)
+			local ok_parser, has_parser = pcall(ModDoesFileExist, path .. "parse_json.lua")
+			if ok_data and has_data and ok_parser and has_parser then
+				return path
+			end
+		end
+	end
+
+	-- Fall back to the path saved by init.lua, then to the default folder name.
+	local saved = ModSettingGet(mod_id .. ".mod_path")
+	if type(saved) == "string" and saved ~= "" then
+		return saved
+	end
+	return "mods/Fork/"
+end
 mod_settings_version = 1 -- This is a magic global that can be used to migrate settings to new mod versions. call mod_settings_get_version() before mod_settings_update() to get the old value. 
 mod_settings = 
 {
@@ -98,8 +123,9 @@ function ModSettingsGui( gui, in_main_menu )
 		
 		local function refresh()
 			active_biomes = {}
-            local parse_json = dofile("mods/Fork/parse_json.lua")
-            local parsed_biomes = parse_json.get_biomes()
+            local mod_path = find_mod_path()
+            local parse_json = dofile(mod_path .. "parse_json.lua")
+            local parsed_biomes = parse_json.get_biomes(mod_path .. DATA_FILE)
             
             local active_states = {}
             for _, b in ipairs(parsed_biomes) do

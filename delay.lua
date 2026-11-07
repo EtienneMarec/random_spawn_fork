@@ -9,26 +9,23 @@ delay.update = function()
     for i = #delay_queue, 1, -1 do
         local v = delay_queue[i]
 
-        -- if v is null, remove it
-        if(v == nil)then
-            table.remove(delay_queue, i)
-            return
-        end
-		
-
-        if(type(v.frames) == "number")then
-            v.frames = v.frames - 1
-        end
-
-        if(v.tick_callback)then
-            v.tick_callback(v.frames)
-        end
-
-        if((type(v.frames) == "number" and v.frames <= 0) or (type(v.frames) == "function" and v.frames()))then
-            if(v.finish_callback)then
-                v.finish_callback()
+        -- An entry can be removed by an earlier callback during this loop (via clear()).
+        if(v ~= nil)then
+            if(type(v.frames) == "number")then
+                v.frames = v.frames - 1
             end
-            table.remove(delay_queue, i)
+
+            if(v.tick_callback)then
+                v.tick_callback(v.frames)
+            end
+
+            if((type(v.frames) == "number" and v.frames <= 0) or (type(v.frames) == "function" and v.frames()))then
+                -- Remove before calling back, so the callback can safely queue new delays.
+                table.remove(delay_queue, i)
+                if(v.finish_callback)then
+                    v.finish_callback()
+                end
+            end
         end
     end
 end
